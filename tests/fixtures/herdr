@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+set -u
+
+if [[ -n ${FAKE_HERDR_LOG:-} ]]; then
+  printf '%s\n' "$*" >> "$FAKE_HERDR_LOG"
+fi
+
+if [[ ${FAKE_HERDR_FAIL:-0} == 1 ]]; then
+  printf '{"error":"simulated failure"}\n' >&2
+  exit 1
+fi
+
+printf '%s\n' '{"result":{"tab":{"tab_id":"test:t1"}}}'

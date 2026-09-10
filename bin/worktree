@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+PROGRAM_NAME=${0##*/}
+release_mode=0
+base_dir=""
+base_was_set=0
+worktree_name=""
+
+rollback_enabled=0
+rollback_repo=""
+rollback_target=""
+rollback_branch=""
+rollback_new_branch=0
+rollback_branch_start=""
+
+usage() {
+  cat <<EOF
+Usage:
+  $PROGRAM_NAME [OPTIONS] NAME
+  $PROGRAM_NAME --release
+  $PROGRAM_NAME -r
+
+Options:
+  -b, --base DIR   Base directory for new worktrees.
+                   Defaults to PROJECT_WORKTREE_DIR.
+  -r, --release    Remove the worktree containing the current directory.
+  -h, --help       Show this help.
+EOF
+}
+
+error() {
+  printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+die() {
+  error "$*"
+  exit 1
+}
+
+usage_error() {
+  error "$*"
+  printf 'Try %s --help for usage.\n' "$PROGRAM_NAME" >&2
+  exit 2
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+canonical_directory() {
+  (
+    cd "$1" 2>/dev/null || exit 1
+    pwd -P
+  )
+}
+
+set_worktree_name() {
+  if [[ -n "$worktree_name" ]]; then
+    usage_error "Only one NAME may be specified."
+  fi
+  worktree_name=$1
+}
+
+rollback_create() {
+  local status=$?
+  local current_branch_tip=""
+
+  trap - EXIT
+
+  if ((rollback_enabled)); then
+    error "Creation failed; rolling back the worktree."
+
+    if [[ -e "$rollback_target" || -L "$rollback_target" ]]; then
+      if ! git -C "$rollback_repo" worktree remove -- "$rollback_target"; then
+        error "Rollback could not remove worktree: $rollback_target"
+      fi
+    fi
+
+    if ((rollback_new_branch)); then
+      current_branch_tip=$(git -C "$rollback_repo" rev-parse --verify "refs/heads/$rollback_branch" 2>/dev/null || true)
+
+      if [[ -n "$current_branch_tip" && "$current_branch_tip" != "$rollback_branch_start" ]]; then
+        error "Rollback retained branch because it was updated after creation: $rollback_branch"
+      elif [[ -n "$current_branch_tip" ]] && ! git -C "$rollback_repo" branch -D -- "$rollback_branch" >/dev/null; then
+        error "Rollback could not remove branch: $rollback_branch"
+      fi
+    fi
+  fi
+
+  exit "$status"
+}
+
+validate_target_components() {
+  local base=$1
+  local relative=$2
+  local current=$base
+  local component
+
+  while [[ "$relative" == */* ]]; do
+    component=${relative%%/*}
+    current=$current/$component
+
+    if [[ -L "$current" ]]; then
+      die "A target path component is a symbolic link: $current"
+    fi
+    if [[ -e "$current" && ! -d "$current" ]]; then
+      die "A target path component is not a directory: $current"
+    fi
+
+    relative=${relative#*/}
+  done
+}
+
+create_worktree() {
+  local repo_root
+  local canonical_base
+  local target
+  local checked_name
+  local branch_start=""
+
+  require_command git
+  require_command herdr
+
+  [[ ${HERDR_ENV:-} == 1 ]] || die "Creation must be run inside a Herdr-managed pane (HERDR_ENV=1)."
+  [[ -n ${HERDR_WORKSPACE_ID:-} ]] || die "HERDR_WORKSPACE_ID is not set."
+
+  repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || die "Not inside a Git worktree."
+  repo_root=$(canonical_directory "$repo_root") || die "Could not resolve repository path: $repo_root"
+  git -C "$repo_root" rev-parse --verify HEAD >/dev/null 2>&1 || die "The repository does not have a valid HEAD."
+
+  if ((base_was_set)); then
+    [[ -n "$base_dir" ]] || usage_error "--base requires a non-empty directory."
+  else
+    base_dir=${PROJECT_WORKTREE_DIR:-}
+    [[ -n "$base_dir" ]] || die "No worktree base directory specified; use --base or set PROJECT_WORKTREE_DIR."
+  fi
+
+  if [[ "$worktree_name" == /* ]]; then
+    die "NAME must be relative, not absolute: $worktree_name"
+  fi
+  checked_name=$(git check-ref-format --branch "$worktree_name" 2>/dev/null) || die "Invalid branch name: $worktree_name"
+  [[ "$checked_name" == "$worktree_name" ]] || die "NAME must be a literal branch name: $worktree_name"
+
+  mkdir -p -- "$base_dir" || die "Could not create base directory: $base_dir"
+  canonical_base=$(canonical_directory "$base_dir") || die "Could not resolve base directory: $base_dir"
+  validate_target_components "$canonical_base" "$worktree_name"
+  target=$canonical_base/$worktree_name
+
+  if [[ -e "$target" || -L "$target" ]]; then
+    die "Target path already exists: $target"
+  fi
+
+  if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$worktree_name"; then
+    rollback_repo=$repo_root
+    rollback_target=$target
+    rollback_branch=$worktree_name
+    rollback_new_branch=0
+    rollback_branch_start=""
+    rollback_enabled=1
+
+    if ! git -C "$repo_root" worktree add "$target" "$worktree_name"; then
+      die "Could not create worktree for existing branch: $worktree_name"
+    fi
+  else
+    branch_start=$(git -C "$repo_root" rev-parse HEAD) || die "Could not resolve HEAD."
+    if ! git -C "$repo_root" branch -- "$worktree_name" "$branch_start"; then
+      die "Could not create branch: $worktree_name"
+    fi
+
+    rollback_repo=$repo_root
+    rollback_target=$target
+    rollback_branch=$worktree_name
+    rollback_new_branch=1
+    rollback_branch_start=$branch_start
+    rollback_enabled=1
+
+    if ! git -C "$repo_root" worktree add "$target" "$worktree_name"; then
+      die "Could not create worktree and branch: $worktree_name"
+    fi
+  fi
+
+  if ! herdr tab create \
+    --workspace "$HERDR_WORKSPACE_ID" \
+    --cwd "$target" \
+    --label "$worktree_name" \
+    --focus >/dev/null; then
+    die "Could not create the Herdr tab."
+  fi
+
+  rollback_enabled=0
+
+  printf 'Created worktree: %s\n' "$target"
+  printf 'Branch: %s\n' "$worktree_name"
+  printf 'Opened Herdr tab for: %s\n' "$target"
+}
+
+release_worktree() {
+  local target
+  local worktree_list
+  local line
+  local listed_path
+  local canonical_listed
+  local main_worktree=""
+  local registered=0
+  local branch=""
+  local detached_commit=""
+  local detached_refs=""
+
+  require_command git
+
+  target=$(git rev-parse --show-toplevel 2>/dev/null) || die "Not inside a Git worktree."
+  target=$(canonical_directory "$target") || die "Could not resolve current worktree path: $target"
+  worktree_list=$(git -C "$target" worktree list --porcelain) || die "Could not list Git worktrees."
+
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*)
+        listed_path=${line#worktree }
+        canonical_listed=$(canonical_directory "$listed_path") || canonical_listed=$listed_path
+
+        if [[ -z "$main_worktree" ]]; then
+          main_worktree=$canonical_listed
+        fi
+        if [[ "$canonical_listed" == "$target" ]]; then
+          registered=1
+        fi
+        ;;
+    esac
+  done <<< "$worktree_list"
+
+  ((registered)) || die "Current directory is not a registered Git worktree: $target"
+  [[ -n "$main_worktree" ]] || die "Could not determine the main Git worktree."
+  [[ "$target" != "$main_worktree" ]] || die "Refusing to remove the main Git worktree: $target"
+
+  if branch=$(git -C "$target" symbolic-ref --quiet --short HEAD); then
+    :
+  else
+    branch=""
+    detached_commit=$(git -C "$target" rev-parse HEAD 2>/dev/null) || \
+      die "Could not resolve detached HEAD in worktree: $target"
+    detached_refs=$(git -C "$target" for-each-ref --format='%(refname)' --contains "$detached_commit") || \
+      die "Could not inspect references containing detached HEAD: $detached_commit"
+    [[ -n "$detached_refs" ]] || \
+      die "Refusing to remove a worktree whose detached HEAD is not reachable from any ref: $detached_commit"
+  fi
+
+  cd "$main_worktree" || die "Could not enter the main Git worktree: $main_worktree"
+  if ! git -C "$main_worktree" worktree remove -- "$target"; then
+    die "Could not remove worktree: $target"
+  fi
+
+  printf 'Removed worktree: %s\n' "$target"
+  if [[ -n "$branch" ]]; then
+    printf 'Branch retained: %s\n' "$branch"
+  elif [[ -n "$detached_commit" ]]; then
+    printf 'Detached HEAD was: %s\n' "$(git -C "$main_worktree" rev-parse --short "$detached_commit")"
+  fi
+  printf 'The current shell is now inside a removed directory.\n'
+  printf 'Press Control-D to close this tab, or run:\n'
+  printf '  cd %q\n' "$main_worktree"
+}
+
+trap rollback_create EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+while (($# > 0)); do
+  case "$1" in
+    -r|--release)
+      release_mode=1
+      shift
+      ;;
+    -b|--base)
+      (($# >= 2)) || usage_error "$1 requires a directory argument."
+      [[ -n "$2" ]] || usage_error "$1 requires a non-empty directory argument."
+      base_dir=$2
+      base_was_set=1
+      shift 2
+      ;;
+    --base=*)
+      base_dir=${1#*=}
+      [[ -n "$base_dir" ]] || usage_error "--base requires a non-empty directory argument."
+      base_was_set=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while (($# > 0)); do
+        set_worktree_name "$1"
+        shift
+      done
+      ;;
+    -*)
+      usage_error "Unknown option: $1"
+      ;;
+    *)
+      set_worktree_name "$1"
+      shift
+      ;;
+  esac
+done
+
+if ((release_mode)); then
+  ((base_was_set == 0)) || usage_error "--release cannot be combined with --base."
+  [[ -z "$worktree_name" ]] || usage_error "--release does not accept NAME."
+  release_worktree
+else
+  [[ -n "$worktree_name" ]] || usage_error "NAME is required."
+  create_worktree
+fi
+
+rollback_enabled=0
