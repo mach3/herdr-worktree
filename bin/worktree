@@ -5,6 +5,7 @@ set -o pipefail
 
 PROGRAM_NAME=${0##*/}
 release_mode=0
+force_release=0
 base_dir=""
 base_was_set=0
 worktree_name=""
@@ -15,18 +16,21 @@ rollback_target=""
 rollback_branch=""
 rollback_new_branch=0
 rollback_branch_start=""
+rollback_copied_files_count=0
+declare -a rollback_copied_files
 
 usage() {
   cat <<EOF
 Usage:
   $PROGRAM_NAME [OPTIONS] NAME
-  $PROGRAM_NAME --release
-  $PROGRAM_NAME -r
+  $PROGRAM_NAME --release [--force]
+  $PROGRAM_NAME -r [-f]
 
 Options:
   -b, --base DIR   Base directory for new worktrees.
                    Defaults to PROJECT_WORKTREE_DIR.
   -r, --release    Remove the worktree containing the current directory.
+  -f, --force      Remove it even when it has uncommitted changes.
   -h, --help       Show this help.
 EOF
 }
@@ -73,6 +77,17 @@ rollback_create() {
   if ((rollback_enabled)); then
     error "Creation failed; rolling back the worktree."
 
+    if ((rollback_copied_files_count > 0)); then
+      local copied_file
+      for copied_file in "${rollback_copied_files[@]}"; do
+        if [[ -e "$copied_file" || -L "$copied_file" ]]; then
+          if ! rm -f -- "$copied_file"; then
+            error "Rollback could not remove copied local config: $copied_file"
+          fi
+        fi
+      done
+    fi
+
     if [[ -e "$rollback_target" || -L "$rollback_target" ]]; then
       if ! git -C "$rollback_repo" worktree remove -- "$rollback_target"; then
         error "Rollback could not remove worktree: $rollback_target"
@@ -91,6 +106,41 @@ rollback_create() {
   fi
 
   exit "$status"
+}
+
+copy_local_agent_config_file() {
+  local source_root=$1
+  local target_root=$2
+  local relative_path=$3
+  local source=$source_root/$relative_path
+  local destination=$target_root/$relative_path
+  local destination_dir=$target_root/${relative_path%/*}
+
+  if [[ ! -e "$source" && ! -L "$source" ]]; then
+    return
+  fi
+  if [[ -L "$source" ]]; then
+    error "Skipping symbolic-link local agent config: $relative_path"
+    return
+  fi
+  if [[ ! -f "$source" ]]; then
+    error "Skipping non-regular local agent config: $relative_path"
+    return
+  fi
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    return
+  fi
+
+  mkdir -p -- "$destination_dir" || die "Could not create local agent config directory: $destination_dir"
+
+  rollback_copied_files[rollback_copied_files_count]=$destination
+  rollback_copied_files_count=$((rollback_copied_files_count + 1))
+  cp -p "$source" "$destination" || die "Could not copy local agent config: $relative_path"
+
+  printf 'Copied local agent config: %s\n' "$relative_path"
+  if ! git -C "$target_root" check-ignore --quiet -- "$relative_path"; then
+    error "Copied local agent config is not ignored by Git: $relative_path"
+  fi
 }
 
 validate_target_components() {
@@ -182,6 +232,9 @@ create_worktree() {
     fi
   fi
 
+  copy_local_agent_config_file "$repo_root" "$target" ".claude/settings.local.json"
+  copy_local_agent_config_file "$repo_root" "$target" ".codex/config.toml"
+
   if ! herdr tab create \
     --workspace "$HERDR_WORKSPACE_ID" \
     --cwd "$target" \
@@ -248,7 +301,11 @@ release_worktree() {
   fi
 
   cd "$main_worktree" || die "Could not enter the main Git worktree: $main_worktree"
-  if ! git -C "$main_worktree" worktree remove -- "$target"; then
+  if ((force_release)); then
+    if ! git -C "$main_worktree" worktree remove --force -- "$target"; then
+      die "Could not forcibly remove worktree: $target"
+    fi
+  elif ! git -C "$main_worktree" worktree remove -- "$target"; then
     die "Could not remove worktree: $target"
   fi
 
@@ -271,6 +328,10 @@ while (($# > 0)); do
   case "$1" in
     -r|--release)
       release_mode=1
+      shift
+      ;;
+    -f|--force)
+      force_release=1
       shift
       ;;
     -b|--base)
@@ -312,6 +373,7 @@ if ((release_mode)); then
   [[ -z "$worktree_name" ]] || usage_error "--release does not accept NAME."
   release_worktree
 else
+  ((force_release == 0)) || usage_error "--force can only be used with --release."
   [[ -n "$worktree_name" ]] || usage_error "NAME is required."
   create_worktree
 fi

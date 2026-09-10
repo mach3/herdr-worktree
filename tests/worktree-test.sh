@@ -159,6 +159,56 @@ test_existing_branch_is_used() {
   [[ $(git -C "$base/existing" branch --show-current) == existing ]]
 }
 
+test_local_agent_configs_are_copied() {
+  local repo
+  local base
+  local output
+
+  repo=$(new_repo local-agent-configs)
+  base=$TEST_ROOT/local-agent-configs/trees
+  output=$TEST_ROOT/local-agent-configs/output
+  mkdir -p "$repo/.claude" "$repo/.codex"
+  printf '{"permissions":{"allow":[]}}\n' >"$repo/.claude/settings.local.json"
+  printf 'model = "test-model"\n' >"$repo/.codex/config.toml"
+
+  (
+    cd "$repo" || exit
+    PATH="$FIXTURE_BIN:$ORIGINAL_PATH" \
+      HERDR_ENV=1 \
+      HERDR_WORKSPACE_ID=w-test \
+      "$WORKTREE_COMMAND" --base "$base" topic >"$output" 2>/dev/null
+  )
+
+  cmp "$repo/.claude/settings.local.json" "$base/topic/.claude/settings.local.json" || return 1
+  cmp "$repo/.codex/config.toml" "$base/topic/.codex/config.toml" || return 1
+  assert_file_contains "$output" "Copied local agent config: .claude/settings.local.json" || return 1
+  assert_file_contains "$output" "Copied local agent config: .codex/config.toml"
+}
+
+test_tracked_agent_config_is_not_overwritten() {
+  local repo
+  local base
+
+  repo=$(new_repo tracked-agent-config)
+  base=$TEST_ROOT/tracked-agent-config/trees
+  mkdir -p "$repo/.codex"
+  printf 'model = "shared-model"\n' >"$repo/.codex/config.toml"
+  git -C "$repo" add -- .codex/config.toml
+  git -C "$repo" commit -q -m add-shared-config
+  printf 'model = "local-override"\n' >"$repo/.codex/config.toml"
+
+  (
+    cd "$repo" || exit
+    PATH="$FIXTURE_BIN:$ORIGINAL_PATH" \
+      HERDR_ENV=1 \
+      HERDR_WORKSPACE_ID=w-test \
+      "$WORKTREE_COMMAND" --base "$base" topic >/dev/null
+  )
+
+  assert_file_contains "$base/topic/.codex/config.toml" 'model = "shared-model"' || return 1
+  [[ -z $(git -C "$base/topic" status --short) ]]
+}
+
 test_missing_base_fails_before_creation() {
   local repo
   local error_file
@@ -210,6 +260,8 @@ test_herdr_failure_rolls_back_new_branch() {
   repo=$(new_repo herdr-failure-new)
   base=$TEST_ROOT/herdr-failure-new/trees
   error_file=$TEST_ROOT/herdr-failure-new/error
+  mkdir -p "$repo/.claude"
+  printf '{"test":true}\n' >"$repo/.claude/settings.local.json"
 
   if (
     cd "$repo" || exit
@@ -295,6 +347,7 @@ test_invalid_invocations() {
     if env -u PROJECT_WORKTREE_DIR "$WORKTREE_COMMAND" >/dev/null 2>&1; then return 1; fi
     if "$WORKTREE_COMMAND" --release topic >/dev/null 2>&1; then return 1; fi
     if "$WORKTREE_COMMAND" --release --base "$base" >/dev/null 2>&1; then return 1; fi
+    if "$WORKTREE_COMMAND" --force topic >/dev/null 2>&1; then return 1; fi
     if "$WORKTREE_COMMAND" --unknown >/dev/null 2>&1; then return 1; fi
     if "$WORKTREE_COMMAND" -b >/dev/null 2>&1; then return 1; fi
     if "$WORKTREE_COMMAND" one two >/dev/null 2>&1; then return 1; fi
@@ -395,6 +448,21 @@ test_release_refuses_main_worktree() {
   assert_file_contains "$error_file" "Refusing to remove the main Git worktree"
 }
 
+test_release_force_refuses_main_worktree() {
+  local repo
+
+  repo=$(new_repo release-force-main)
+
+  if (
+    cd "$repo" || exit
+    "$WORKTREE_COMMAND" --release --force >/dev/null 2>/dev/null
+  ); then
+    return 1
+  fi
+
+  [[ -d "$repo" ]]
+}
+
 test_release_refuses_dirty_worktree() {
   local repo
   local target
@@ -415,6 +483,45 @@ test_release_refuses_dirty_worktree() {
 
   [[ -d "$target" ]] || return 1
   assert_file_contains "$error_file" "Could not remove worktree"
+}
+
+test_release_force_removes_dirty_worktree() {
+  local repo
+  local target
+
+  repo=$(new_repo release-force-dirty)
+  target=$TEST_ROOT/release-force-dirty/topic
+  printf 'original\n' >"$repo/tracked.txt"
+  git -C "$repo" add tracked.txt
+  git -C "$repo" commit -q -m add-tracked-file
+  git -C "$repo" worktree add -q -b topic "$target"
+  printf 'modified\n' >"$target/tracked.txt"
+  printf 'untracked\n' >"$target/untracked.txt"
+
+  (
+    cd "$target" || exit
+    "$WORKTREE_COMMAND" --release --force >/dev/null
+  )
+
+  [[ ! -e "$target" ]] || return 1
+  git -C "$repo" show-ref --verify --quiet refs/heads/topic
+}
+
+test_release_short_force_removes_dirty_worktree() {
+  local repo
+  local target
+
+  repo=$(new_repo release-short-force-dirty)
+  target=$TEST_ROOT/release-short-force-dirty/topic
+  git -C "$repo" worktree add -q -b topic "$target"
+  printf 'untracked\n' >"$target/untracked.txt"
+
+  (
+    cd "$target" || exit
+    "$WORKTREE_COMMAND" -r -f >/dev/null
+  )
+
+  [[ ! -e "$target" ]]
 }
 
 test_release_removes_ignored_files() {
@@ -459,6 +566,25 @@ test_release_refuses_unreferenced_detached_head() {
   assert_file_contains "$error_file" "detached HEAD is not reachable from any ref"
 }
 
+test_release_force_refuses_unreferenced_detached_head() {
+  local repo
+  local target
+
+  repo=$(new_repo release-force-unreferenced-detached)
+  target=$TEST_ROOT/release-force-unreferenced-detached/topic
+  git -C "$repo" worktree add -q --detach "$target"
+  git -C "$target" commit -q --allow-empty -m detached-only
+
+  if (
+    cd "$target" || exit
+    "$WORKTREE_COMMAND" --release --force >/dev/null 2>/dev/null
+  ); then
+    return 1
+  fi
+
+  [[ -d "$target" ]]
+}
+
 test_release_allows_referenced_detached_head() {
   local repo
   local target
@@ -490,12 +616,14 @@ test_release_outside_git_fails() {
   assert_file_contains "$error_file" "Not inside a Git worktree"
 }
 
-printf '1..21\n'
+printf '1..27\n'
 run_test "help describes the command" test_help
 run_test "-b creates a nested branch worktree and focused Herdr tab" test_short_base_creates_new_branch_and_tab
 run_test "PROJECT_WORKTREE_DIR supplies the base directory" test_environment_base
 run_test "--base overrides PROJECT_WORKTREE_DIR" test_option_base_overrides_environment
 run_test "an existing local branch is reused" test_existing_branch_is_used
+run_test "local Claude and Codex project settings are copied" test_local_agent_configs_are_copied
+run_test "tracked agent configuration is not overwritten" test_tracked_agent_config_is_not_overwritten
 run_test "creation fails when no base directory is configured" test_missing_base_fails_before_creation
 run_test "creation fails outside Herdr before changing Git" test_creation_outside_herdr_fails
 run_test "Herdr failure rolls back a new branch and worktree" test_herdr_failure_rolls_back_new_branch
@@ -507,9 +635,13 @@ run_test "a branch already used by another worktree is rejected" test_branch_in_
 run_test "release works from a subdirectory and keeps the branch" test_release_from_subdirectory_keeps_branch
 run_test "--release removes a clean linked worktree" test_release_long_option
 run_test "release refuses the main worktree" test_release_refuses_main_worktree
+run_test "--force still refuses the main worktree" test_release_force_refuses_main_worktree
 run_test "release refuses a dirty worktree" test_release_refuses_dirty_worktree
+run_test "--force removes a dirty worktree and keeps its branch" test_release_force_removes_dirty_worktree
+run_test "-f removes a dirty worktree in short release mode" test_release_short_force_removes_dirty_worktree
 run_test "release removes ignored files with the worktree" test_release_removes_ignored_files
 run_test "release refuses an unreferenced detached HEAD" test_release_refuses_unreferenced_detached_head
+run_test "--force still refuses an unreferenced detached HEAD" test_release_force_refuses_unreferenced_detached_head
 run_test "release allows a detached HEAD reachable from a ref" test_release_allows_referenced_detached_head
 run_test "release fails outside a Git worktree" test_release_outside_git_fails
 
