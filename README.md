@@ -57,6 +57,19 @@ worktree -b "$HOME/other-worktrees" feature/login
 
 作成されたタブには `NAME` がラベルとして設定され、対象 worktree に移動した状態でフォーカスされます。作成操作は Herdr 管理下のpaneから実行する必要があります。
 
+### ローカルAIエージェント設定のコピー
+
+呼び出し元worktreeに次のローカル設定ファイルがあれば、新しいworktreeへコピーします。
+
+- `.claude/settings.local.json`
+- `.codex/config.toml`
+
+Codexでは、個人の既定設定は`~/.codex/config.toml`、プロジェクト単位の上書きは`.codex/config.toml`です。後者は信頼済みプロジェクトでのみ読み込まれます。詳細は[OpenAIのCodex設定ドキュメント](https://learn.chatgpt.com/docs/config-file/config-basic)を参照してください。
+
+コピー元はコマンドを実行したworktreeです。通常ファイルだけを対象とし、symbolic linkはコピーしません。新しいworktree側にtrackedファイルなどがすでに存在する場合も上書きしません。
+
+コピーされた設定がGitでignoreされていない場合は警告します。ローカル設定には権限、コマンド、マシン固有パスなどが含まれる可能性があるため、公開リポジトリへ誤ってcommitしないよう、必要に応じて`.gitignore`または`.git/info/exclude`へ追加してください。
+
 ### worktree の解放
 
 削除したいlinked worktree内で実行します。サブディレクトリからでも構いません。
@@ -67,7 +80,15 @@ worktree --release
 worktree -r
 ```
 
-release は現在位置のlinked worktreeだけを対象にし、メインworktreeは削除しません。ブランチも残します。また、通常の変更や未追跡ファイルが残っているworktreeはGitによって削除を拒否されます。ただし、`.gitignore` などで除外されたignoredファイルはworktreeとともに削除されます。必要なローカル設定やデータは、別の場所に原本を保持してください。detached HEADの場合、そのcommitがいずれのrefからも到達できなければ、commit消失を防ぐため削除を拒否します。
+release は現在位置のlinked worktreeだけを対象にし、メインworktreeは削除しません。ブランチも残します。また、通常の変更や未追跡ファイルが残っているworktreeはGitによって削除を拒否されます。変更を破棄して強制的に削除する場合は、`--force` / `-f`を併用します。
+
+```bash
+worktree --release --force
+# または
+worktree -r -f
+```
+
+`--force`を指定すると、trackedファイルの変更と未追跡ファイルはworktreeとともに失われます。`.gitignore`などで除外されたignoredファイルは、`--force`の有無にかかわらずworktreeとともに削除されます。必要なローカル設定やデータは、別の場所に原本を保持してください。detached HEADの場合、そのcommitがいずれのrefからも到達できなければ、`--force`を指定してもcommit消失を防ぐため削除を拒否します。
 
 release 後も Herdr タブと呼び出し元のシェルは残りますが、シェルのカレントディレクトリは削除済みです。シェルプロンプトで `Control-D` を入力してタブを閉じるか、成功メッセージに表示されたメインworktreeへ移動してください。
 
@@ -82,17 +103,18 @@ release 自体は Herdr 管理外でも使用できます。
 ```text
 Usage:
   worktree [OPTIONS] NAME
-  worktree --release
-  worktree -r
+  worktree --release [--force]
+  worktree -r [-f]
 
 Options:
   -b, --base DIR   Base directory for new worktrees.
                    Defaults to PROJECT_WORKTREE_DIR.
   -r, --release    Remove the worktree containing the current directory.
+  -f, --force      Remove it even when it has uncommitted changes.
   -h, --help       Show this help.
 ```
 
-`--release` / `-r` に `NAME` は指定できません。`--base` / `-b` とreleaseの併用もエラーになります。
+`--release` / `-r` に `NAME` は指定できません。`--base` / `-b` とreleaseの併用、および作成モードでの`--force` / `-f`はエラーになります。
 
 ## テスト
 

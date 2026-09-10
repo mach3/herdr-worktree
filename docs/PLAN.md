@@ -23,13 +23,14 @@
 ```text
 Usage:
   worktree [OPTIONS] NAME
-  worktree --release
-  worktree -r
+  worktree --release [--force]
+  worktree -r [-f]
 
 Options:
   -b, --base DIR   Base directory for new worktrees.
                    Defaults to PROJECT_WORKTREE_DIR.
   -r, --release    Remove the worktree containing the current directory.
+  -f, --force      Remove it even when it has uncommitted changes.
   -h, --help       Show help.
 ```
 
@@ -42,6 +43,8 @@ worktree --base "$HOME/worktrees" feature/login
 worktree --base="$HOME/worktrees" feature/login
 worktree -r
 worktree --release
+worktree -r -f
+worktree --release --force
 ```
 
 `worktree` は独立したローカルコマンドであり、`git worktree` サブコマンドとは別物である。この違いと、`bin/worktree` を `PATH` に追加する方法を README に明記する。
@@ -51,6 +54,7 @@ worktree --release
 - `-bDIR` のような短いオプションと値の結合
 - `-rbDIR` のような短いオプションのクラスタリング
 - `--release` / `-r` における `NAME` 指定
+- 作成モードにおける `--force` / `-f`
 
 次の場合は使用法エラーとして終了コード 2 を返す。
 
@@ -58,6 +62,7 @@ worktree --release
 - 位置引数が複数ある
 - release モードで位置引数が指定された
 - release モードと `--base` / `-b` が併用された
+- 作成モードで `--force` / `-f` が指定された
 - `--base` / `-b` の値が空、または欠落している
 - 未知のオプションが指定された
 
@@ -125,8 +130,9 @@ git worktree add "$target" "$name"
 6. オプションまたは環境変数からベースディレクトリを決定する。
 7. `NAME` と対象パスを検証する。
 8. ブランチの既存・新規を記録し、新規ならブランチを明示的に作成してから `git worktree add` を実行する。
-9. 現在の Herdr workspace に、対象パスを cwd とするタブを作成してフォーカスする。
-10. 作成された worktree パスとブランチ名を表示する。
+9. 呼び出し元worktreeにある対応済みのローカルAIエージェント設定をコピーする。
+10. 現在の Herdr workspace に、対象パスを cwd とするタブを作成してフォーカスする。
+11. 作成された worktree パスとブランチ名を表示する。
 
 Herdr タブの作成には、暗黙の UI フォーカスではなく呼び出し元の workspace ID を明示する。
 
@@ -140,14 +146,26 @@ herdr tab create \
 
 タブ ID は後続処理で使わないため、Herdr の返却 JSON は解析しない。タブ作成コマンドの終了ステータスだけを確認し、標準出力の JSON は抑制する。このため `jq` には依存しない。
 
+## ローカルAIエージェント設定のコピー
+
+`git worktree add`の後、Herdrタブを開く前に、呼び出し元worktreeから次のファイルをコピーする。
+
+- `.claude/settings.local.json`
+- `.codex/config.toml`
+
+通常ファイルだけを対象とし、symbolic linkはコピーしない。コピー先にtrackedファイルなどがすでに存在する場合は上書きしない。コピー後のファイルがGitでignoreされていなければ、将来のcommitへの混入を防ぐため警告する。
+
+コピー途中またはHerdrタブ作成時に失敗した場合、コピーしたファイルを削除してからworktreeと新規ブランチをロールバックする。
+
 ## 作成失敗時のロールバック
 
-worktree 作成後に Herdr タブの作成が失敗した場合は、作成途中の状態を残さない。
+worktree 作成後の設定コピーまたは Herdr タブの作成が失敗した場合は、作成途中の状態を残さない。
 
 状態フラグと EXIT trap を使い、逆順に次を試みる。
 
-1. 作成した worktree を `git worktree remove` で削除する。
-2. 今回の実行で新規作成し、作成時点から先端が更新されていないブランチだけを削除する。
+1. 今回コピーしたローカル設定ファイルを削除する。
+2. 作成した worktree を `git worktree remove` で削除する。
+3. 今回の実行で新規作成し、作成時点から先端が更新されていないブランチだけを削除する。
 
 既存ブランチはロールバック時にも削除しない。`git worktree add` 自体が非ゼロで終了した場合も、作成済みのworktreeやブランチが残っていればロールバックする。ロールバック自体に失敗した場合は、残った worktree とブランチを stderr に明示する。
 
@@ -177,11 +195,13 @@ git rev-parse --show-toplevel
 3. 対象が削除可能な linked worktree であることを検証する。
 4. 未参照のdetached HEAD commitがないことを検証する。
 5. スクリプト自身の cwd をメイン worktree へ移す。
-6. メイン worktree 側から `git worktree remove "$target"` を実行する。
+6. メイン worktree 側から `git worktree remove "$target"` を実行する。`--force` / `-f`指定時は`git worktree remove --force "$target"`を実行する。
 7. 削除した worktree、保持したブランチ、メイン worktree のパスを表示する。
 8. 呼び出し元シェルの cwd が削除済みであることと、`Control-D` または `cd` で抜ける方法を表示する。
 
-`git worktree remove` に `--force` は付けない。未コミット変更や通常の未追跡ファイルによって Git が削除を拒否した場合は、そのエラーを利用者へ返す。Gitが削除を許可するignoredファイルはworktreeとともに削除されるため、必要なデータは別の場所に原本を保持する運用とする。
+通常は`git worktree remove`に`--force`を付けない。未コミット変更や通常の未追跡ファイルによってGitが削除を拒否した場合は、そのエラーを利用者へ返す。利用者が`--force` / `-f`を明示した場合だけGitへ`--force`を渡し、未コミット変更を含むworktreeを削除する。Gitが削除を許可するignoredファイルはworktreeとともに削除されるため、必要なデータは別の場所に原本を保持する運用とする。
+
+強制削除でも、メインworktreeの保護と未参照detached HEADの保護は解除しない。`--force`が変更するのは、Gitによるdirty worktreeの削除可否だけとする。
 
 release ではブランチを削除しない。worktree の削除とブランチの削除は別の操作として扱う。
 
@@ -237,8 +257,10 @@ Press Control-D to close this tab, or run:
 - オプションがなければ `PROJECT_WORKTREE_DIR` を使用する
 - ベース未指定で失敗する
 - `-r` と `--release` が同じ動作をする
+- `-f` と `--force` がdirty worktreeを強制削除する
 - release で `NAME` を指定すると失敗する
 - release と `--base` / `-b` の併用が失敗する
+- 作成モードと`--force` / `-f`の併用が失敗する
 - 不明なオプション、余分な位置引数、欠落した値が失敗する
 
 ### 作成
@@ -253,15 +275,21 @@ Press Control-D to close this tab, or run:
 - Herdr 失敗時に worktree と今回作成したブランチをロールバックする
 - 既存ブランチはロールバック時も残る
 - `git worktree add` が副作用を残して失敗してもworktreeと新規ブランチをロールバックする
+- 呼び出し元のClaude・Codexローカル設定を新しいworktreeへコピーする
+- コピー先に既存の設定がある場合は上書きしない
+- ローカル設定コピー後の失敗でもworktreeをロールバックする
 
 ### release
 
 - worktree 直下とそのサブディレクトリの両方から対象を特定できる
 - メイン worktree の削除を拒否する
+- `--force` / `-f`でもメインworktreeの削除を拒否する
 - Git worktree ではないディレクトリからの実行を拒否する
 - dirty worktree の削除に失敗する
+- `--force` / `-f`でdirty worktreeを削除できる
 - ignoredファイルを含むworktreeを削除できる
 - 未参照commitを指すdetached worktreeの削除を拒否する
+- `--force` / `-f`でも未参照commitを指すdetached worktreeの削除を拒否する
 - refから到達可能なdetached worktreeは削除できる
 - clean worktree を削除してブランチを残す
 - release は Herdr 管理外でも同じ Git 操作として成功する
@@ -272,18 +300,19 @@ Press Control-D to close this tab, or run:
 1. CLI パーサー、usage、エラー出力を実装する。
 2. パス正規化、Git リポジトリ情報取得、worktree 判定の小さな関数を実装する。
 3. worktree 作成とブランチ分岐を実装する。
-4. Herdr タブ作成と終了ステータスの確認を実装する。
-5. 作成失敗時のロールバックを実装する。
-6. 現在位置限定の release と安全確認を実装する。
-7. release 後の cwd 消失に関する案内を実装する。
-8. 偽 Herdr CLI を使うテストを追加する。
-9. README と使用例を追加する。
-10. ShellCheck が利用可能なら静的検査を行い、全テストを実行する。
+4. ローカルAIエージェント設定のコピーを実装する。
+5. Herdr タブ作成と終了ステータスの確認を実装する。
+6. 作成失敗時のロールバックを実装する。
+7. 現在位置限定の release と安全確認を実装する。
+8. release 後の cwd 消失に関する案内を実装する。
+9. 偽 Herdr CLI を使うテストを追加する。
+10. README と使用例を追加する。
+11. ShellCheck が利用可能なら静的検査を行い、全テストを実行する。
 
 ## 完了条件
 
 - 作成と release の正常系が仕様どおり動作する
-- 誤った worktree、メイン worktree、dirty worktreeを強制削除しない
+- 誤ったworktreeとメインworktreeを削除せず、dirty worktreeは明示的な`--force` / `-f`なしでは削除しない
 - Herdr 操作失敗時に不要な作成物を可能な限りロールバックする
 - release 後の呼び出し元シェルの状態と復帰方法が明確に案内される
 - Bash 3.2 互換のテストがすべて成功する
