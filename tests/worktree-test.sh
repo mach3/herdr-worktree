@@ -159,14 +159,14 @@ test_existing_branch_is_used() {
   [[ $(git -C "$base/existing" branch --show-current) == existing ]]
 }
 
-test_local_agent_configs_are_copied() {
+test_local_configs_are_copied() {
   local repo
   local base
   local output
 
-  repo=$(new_repo local-agent-configs)
-  base=$TEST_ROOT/local-agent-configs/trees
-  output=$TEST_ROOT/local-agent-configs/output
+  repo=$(new_repo local-configs)
+  base=$TEST_ROOT/local-configs/trees
+  output=$TEST_ROOT/local-configs/output
   mkdir -p "$repo/.claude" "$repo/.codex" "$repo/.zed"
   printf '{"permissions":{"allow":[]}}\n' >"$repo/.claude/settings.local.json"
   printf 'model = "test-model"\n' >"$repo/.codex/config.toml"
@@ -188,12 +188,12 @@ test_local_agent_configs_are_copied() {
   assert_file_contains "$output" "Copied local config: .zed/settings.json"
 }
 
-test_tracked_agent_config_is_not_overwritten() {
+test_tracked_local_config_is_not_overwritten() {
   local repo
   local base
 
-  repo=$(new_repo tracked-agent-config)
-  base=$TEST_ROOT/tracked-agent-config/trees
+  repo=$(new_repo tracked-local-config)
+  base=$TEST_ROOT/tracked-local-config/trees
   mkdir -p "$repo/.codex"
   printf 'model = "shared-model"\n' >"$repo/.codex/config.toml"
   git -C "$repo" add -- .codex/config.toml
@@ -625,8 +625,8 @@ run_test "-b creates a nested branch worktree and focused Herdr tab" test_short_
 run_test "PROJECT_WORKTREE_DIR supplies the base directory" test_environment_base
 run_test "--base overrides PROJECT_WORKTREE_DIR" test_option_base_overrides_environment
 run_test "an existing local branch is reused" test_existing_branch_is_used
-run_test "local Claude, Codex, and Zed project settings are copied" test_local_agent_configs_are_copied
-run_test "tracked agent configuration is not overwritten" test_tracked_agent_config_is_not_overwritten
+run_test "local Claude, Codex, and Zed project settings are copied" test_local_configs_are_copied
+run_test "tracked local configuration is not overwritten" test_tracked_local_config_is_not_overwritten
 run_test "creation fails when no base directory is configured" test_missing_base_fails_before_creation
 run_test "creation fails outside Herdr before changing Git" test_creation_outside_herdr_fails
 run_test "Herdr failure rolls back a new branch and worktree" test_herdr_failure_rolls_back_new_branch
