@@ -146,12 +146,13 @@ herdr tab create \
 
 タブ ID は後続処理で使わないため、Herdr の返却 JSON は解析しない。タブ作成コマンドの終了ステータスだけを確認し、標準出力の JSON は抑制する。このため `jq` には依存しない。
 
-## ローカルAIエージェント設定のコピー
+## ローカル設定のコピー
 
 `git worktree add`の後、Herdrタブを開く前に、呼び出し元worktreeから次のファイルをコピーする。
 
 - `.claude/settings.local.json`
 - `.codex/config.toml`
+- `.zed/settings.json`
 
 通常ファイルだけを対象とし、symbolic linkはコピーしない。コピー先にtrackedファイルなどがすでに存在する場合は上書きしない。コピー後のファイルがGitでignoreされていなければ、将来のcommitへの混入を防ぐため警告する。
 
@@ -275,7 +276,7 @@ Press Control-D to close this tab, or run:
 - Herdr 失敗時に worktree と今回作成したブランチをロールバックする
 - 既存ブランチはロールバック時も残る
 - `git worktree add` が副作用を残して失敗してもworktreeと新規ブランチをロールバックする
-- 呼び出し元のClaude・Codexローカル設定を新しいworktreeへコピーする
+- 呼び出し元のClaude・Codex・Zedのローカル設定を新しいworktreeへコピーする
 - コピー先に既存の設定がある場合は上書きしない
 - ローカル設定コピー後の失敗でもworktreeをロールバックする
 

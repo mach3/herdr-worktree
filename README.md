@@ -57,12 +57,13 @@ worktree -b "$HOME/other-worktrees" feature/login
 
 作成されたタブには `NAME` がラベルとして設定され、対象 worktree に移動した状態でフォーカスされます。作成操作は Herdr 管理下のpaneから実行する必要があります。
 
-### ローカルAIエージェント設定のコピー
+### ローカル設定のコピー
 
 呼び出し元worktreeに次のローカル設定ファイルがあれば、新しいworktreeへコピーします。
 
 - `.claude/settings.local.json`
 - `.codex/config.toml`
+- `.zed/settings.json`
 
 Codexでは、個人の既定設定は`~/.codex/config.toml`、プロジェクト単位の上書きは`.codex/config.toml`です。後者は信頼済みプロジェクトでのみ読み込まれます。詳細は[OpenAIのCodex設定ドキュメント](https://learn.chatgpt.com/docs/config-file/config-basic)を参照してください。
 
