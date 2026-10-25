@@ -167,9 +167,10 @@ test_local_agent_configs_are_copied() {
   repo=$(new_repo local-agent-configs)
   base=$TEST_ROOT/local-agent-configs/trees
   output=$TEST_ROOT/local-agent-configs/output
-  mkdir -p "$repo/.claude" "$repo/.codex"
+  mkdir -p "$repo/.claude" "$repo/.codex" "$repo/.zed"
   printf '{"permissions":{"allow":[]}}\n' >"$repo/.claude/settings.local.json"
   printf 'model = "test-model"\n' >"$repo/.codex/config.toml"
+  printf '{"tab_size":2}\n' >"$repo/.zed/settings.json"
 
   (
     cd "$repo" || exit
@@ -181,8 +182,10 @@ test_local_agent_configs_are_copied() {
 
   cmp "$repo/.claude/settings.local.json" "$base/topic/.claude/settings.local.json" || return 1
   cmp "$repo/.codex/config.toml" "$base/topic/.codex/config.toml" || return 1
-  assert_file_contains "$output" "Copied local agent config: .claude/settings.local.json" || return 1
-  assert_file_contains "$output" "Copied local agent config: .codex/config.toml"
+  cmp "$repo/.zed/settings.json" "$base/topic/.zed/settings.json" || return 1
+  assert_file_contains "$output" "Copied local config: .claude/settings.local.json" || return 1
+  assert_file_contains "$output" "Copied local config: .codex/config.toml" || return 1
+  assert_file_contains "$output" "Copied local config: .zed/settings.json"
 }
 
 test_tracked_agent_config_is_not_overwritten() {
@@ -622,7 +625,7 @@ run_test "-b creates a nested branch worktree and focused Herdr tab" test_short_
 run_test "PROJECT_WORKTREE_DIR supplies the base directory" test_environment_base
 run_test "--base overrides PROJECT_WORKTREE_DIR" test_option_base_overrides_environment
 run_test "an existing local branch is reused" test_existing_branch_is_used
-run_test "local Claude and Codex project settings are copied" test_local_agent_configs_are_copied
+run_test "local Claude, Codex, and Zed project settings are copied" test_local_agent_configs_are_copied
 run_test "tracked agent configuration is not overwritten" test_tracked_agent_config_is_not_overwritten
 run_test "creation fails when no base directory is configured" test_missing_base_fails_before_creation
 run_test "creation fails outside Herdr before changing Git" test_creation_outside_herdr_fails

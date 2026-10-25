@@ -108,7 +108,7 @@ rollback_create() {
   exit "$status"
 }
 
-copy_local_agent_config_file() {
+copy_local_config_file() {
   local source_root=$1
   local target_root=$2
   local relative_path=$3
@@ -120,26 +120,26 @@ copy_local_agent_config_file() {
     return
   fi
   if [[ -L "$source" ]]; then
-    error "Skipping symbolic-link local agent config: $relative_path"
+    error "Skipping symbolic-link local config: $relative_path"
     return
   fi
   if [[ ! -f "$source" ]]; then
-    error "Skipping non-regular local agent config: $relative_path"
+    error "Skipping non-regular local config: $relative_path"
     return
   fi
   if [[ -e "$destination" || -L "$destination" ]]; then
     return
   fi
 
-  mkdir -p -- "$destination_dir" || die "Could not create local agent config directory: $destination_dir"
+  mkdir -p -- "$destination_dir" || die "Could not create local config directory: $destination_dir"
 
   rollback_copied_files[rollback_copied_files_count]=$destination
   rollback_copied_files_count=$((rollback_copied_files_count + 1))
-  cp -p "$source" "$destination" || die "Could not copy local agent config: $relative_path"
+  cp -p "$source" "$destination" || die "Could not copy local config: $relative_path"
 
-  printf 'Copied local agent config: %s\n' "$relative_path"
+  printf 'Copied local config: %s\n' "$relative_path"
   if ! git -C "$target_root" check-ignore --quiet -- "$relative_path"; then
-    error "Copied local agent config is not ignored by Git: $relative_path"
+    error "Copied local config is not ignored by Git: $relative_path"
   fi
 }
 
@@ -232,8 +232,9 @@ create_worktree() {
     fi
   fi
 
-  copy_local_agent_config_file "$repo_root" "$target" ".claude/settings.local.json"
-  copy_local_agent_config_file "$repo_root" "$target" ".codex/config.toml"
+  copy_local_config_file "$repo_root" "$target" ".claude/settings.local.json"
+  copy_local_config_file "$repo_root" "$target" ".codex/config.toml"
+  copy_local_config_file "$repo_root" "$target" ".zed/settings.json"
 
   if ! herdr tab create \
     --workspace "$HERDR_WORKSPACE_ID" \
