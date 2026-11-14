@@ -14,8 +14,10 @@ rollback_enabled=0
 rollback_repo=""
 rollback_target=""
 rollback_branch=""
-rollback_new_branch=0
+# What this run did to the branch: "", "creation", or "fast-forwarding".
+rollback_branch_change=""
 rollback_branch_start=""
+rollback_branch_original_tip=""
 rollback_copied_files_count=0
 declare -a rollback_copied_files
 
@@ -39,6 +41,10 @@ error() {
   printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2
 }
 
+warn() {
+  printf '%s: warning: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
 die() {
   error "$*"
   exit 1
@@ -59,6 +65,62 @@ canonical_directory() {
     cd "$1" 2>/dev/null || exit 1
     pwd -P
   )
+}
+
+short_commit() {
+  git -C "$1" rev-parse --short "$2"
+}
+
+# Prints the default branch ref: origin/HEAD, then local main, then master.
+default_branch_ref() {
+  local repo=$1
+  local ref
+
+  if ref=$(git -C "$repo" symbolic-ref --quiet refs/remotes/origin/HEAD) && \
+    git -C "$repo" rev-parse --verify --quiet "$ref" >/dev/null; then
+    printf '%s\n' "$ref"
+    return
+  fi
+  for ref in refs/heads/main refs/heads/master; do
+    if git -C "$repo" rev-parse --verify --quiet "$ref" >/dev/null; then
+      printf '%s\n' "$ref"
+      return
+    fi
+  done
+}
+
+# Prints why an existing branch behind HEAD must not be fast-forwarded, or
+# nothing when moving it to HEAD is safe. ahead_count is the number of commits
+# on the branch that HEAD does not contain.
+fast_forward_blocker() {
+  local repo=$1
+  local branch=$2
+  local tip=$3
+  local ahead_count=$4
+  local upstream
+  local default_ref
+  local default_name
+
+  if ((ahead_count > 0)); then
+    printf 'it has its own commits\n'
+    return
+  fi
+
+  upstream=$(git -C "$repo" for-each-ref --format='%(upstream:short)' "refs/heads/$branch")
+  if [[ -n "$upstream" ]]; then
+    printf 'it tracks %s\n' "$upstream"
+    return
+  fi
+
+  default_ref=$(default_branch_ref "$repo")
+  if [[ -z "$default_ref" ]]; then
+    printf 'no default branch was found\n'
+    return
+  fi
+  if ! git -C "$repo" merge-base --is-ancestor "$tip" "$default_ref"; then
+    default_name=${default_ref#refs/heads/}
+    printf 'it has commits that are not in %s\n' "${default_name#refs/remotes/}"
+  fi
 }
 
 set_worktree_name() {
@@ -94,13 +156,25 @@ rollback_create() {
       fi
     fi
 
-    if ((rollback_new_branch)); then
+    # Put the branch back where it was (deleted for a new branch), unless
+    # something else moved it after this run did.
+    if [[ -n "$rollback_branch_change" ]]; then
       current_branch_tip=$(git -C "$rollback_repo" rev-parse --verify "refs/heads/$rollback_branch" 2>/dev/null || true)
 
-      if [[ -n "$current_branch_tip" && "$current_branch_tip" != "$rollback_branch_start" ]]; then
-        error "Rollback retained branch because it was updated after creation: $rollback_branch"
-      elif [[ -n "$current_branch_tip" ]] && ! git -C "$rollback_repo" branch -D -- "$rollback_branch" >/dev/null; then
-        error "Rollback could not remove branch: $rollback_branch"
+      if [[ -z "$current_branch_tip" ]]; then
+        if [[ -n "$rollback_branch_original_tip" ]]; then
+          error "Rollback could not restore branch because it no longer exists: $rollback_branch (was $rollback_branch_original_tip)"
+        fi
+      elif [[ "$current_branch_tip" != "$rollback_branch_start" ]]; then
+        if [[ "$current_branch_tip" != "$rollback_branch_original_tip" ]]; then
+          error "Rollback retained branch because it was updated after $rollback_branch_change: $rollback_branch"
+        fi
+      elif [[ -z "$rollback_branch_original_tip" ]]; then
+        if ! git -C "$rollback_repo" branch -D -- "$rollback_branch" >/dev/null; then
+          error "Rollback could not remove branch: $rollback_branch"
+        fi
+      elif ! git -C "$rollback_repo" branch -f -- "$rollback_branch" "$rollback_branch_original_tip" >/dev/null; then
+        error "Rollback could not restore branch $rollback_branch to $rollback_branch_original_tip"
       fi
     fi
   fi
@@ -170,6 +244,14 @@ create_worktree() {
   local target
   local checked_name
   local branch_start=""
+  local existing_tip=""
+  local counts
+  local ahead_count=0
+  local behind_count=0
+  local fast_forward_reason=""
+  local worktree_add_error=""
+  local branch_summary=""
+  local branch_warning=""
 
   require_command git
   require_command herdr
@@ -203,33 +285,56 @@ create_worktree() {
     die "Target path already exists: $target"
   fi
 
-  if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$worktree_name"; then
-    rollback_repo=$repo_root
-    rollback_target=$target
-    rollback_branch=$worktree_name
-    rollback_new_branch=0
-    rollback_branch_start=""
-    rollback_enabled=1
+  branch_start=$(git -C "$repo_root" rev-parse HEAD) || die "Could not resolve HEAD."
+  existing_tip=$(git -C "$repo_root" rev-parse --verify --quiet "refs/heads/$worktree_name") || existing_tip=""
 
-    if ! git -C "$repo_root" worktree add "$target" "$worktree_name"; then
-      die "Could not create worktree for existing branch: $worktree_name"
+  rollback_repo=$repo_root
+  rollback_target=$target
+  rollback_branch=$worktree_name
+  rollback_branch_start=$branch_start
+
+  if [[ -n "$existing_tip" ]]; then
+    # Nothing has changed yet, so rollback only reverts what is recorded below.
+    rollback_enabled=1
+    worktree_add_error="Could not create worktree for existing branch: $worktree_name"
+    counts=$(git -C "$repo_root" rev-list --left-right --count "$existing_tip...$branch_start") || \
+      die "Could not compare existing branch with HEAD: $worktree_name"
+    read -r ahead_count behind_count <<< "$counts"
+
+    if ((behind_count > 0)); then
+      fast_forward_reason=$(fast_forward_blocker "$repo_root" "$worktree_name" "$existing_tip" "$ahead_count")
+    fi
+
+    if ((behind_count > 0)) && [[ -z "$fast_forward_reason" ]]; then
+      # The branch has no commits outside the default branch and has never been
+      # pushed, so moving it to HEAD loses nothing and makes it start from the
+      # same point as a newly created branch.
+      rollback_branch_change=fast-forwarding
+      rollback_branch_original_tip=$existing_tip
+      if ! git -C "$repo_root" branch -f -- "$worktree_name" "$branch_start" >/dev/null; then
+        die "Could not fast-forward existing branch: $worktree_name"
+      fi
+      branch_summary="Fast-forwarded existing branch: $worktree_name ($(short_commit "$repo_root" "$existing_tip") -> $(short_commit "$repo_root" "$branch_start"))"
+    else
+      branch_summary="Using existing branch: $worktree_name at $(short_commit "$repo_root" "$existing_tip")"
+      if ((behind_count > 0)); then
+        branch_warning="Existing branch $worktree_name is $behind_count commit(s) behind HEAD and was not fast-forwarded because $fast_forward_reason; rebase it if it should start from HEAD."
+      fi
     fi
   else
-    branch_start=$(git -C "$repo_root" rev-parse HEAD) || die "Could not resolve HEAD."
+    worktree_add_error="Could not create worktree and branch: $worktree_name"
+    branch_summary="Created branch: $worktree_name from $(short_commit "$repo_root" "$branch_start")"
     if ! git -C "$repo_root" branch -- "$worktree_name" "$branch_start"; then
       die "Could not create branch: $worktree_name"
     fi
-
-    rollback_repo=$repo_root
-    rollback_target=$target
-    rollback_branch=$worktree_name
-    rollback_new_branch=1
-    rollback_branch_start=$branch_start
+    # Enabled only after creation, so a failed "git branch" never deletes a
+    # branch that someone else created concurrently.
+    rollback_branch_change=creation
     rollback_enabled=1
+  fi
 
-    if ! git -C "$repo_root" worktree add "$target" "$worktree_name"; then
-      die "Could not create worktree and branch: $worktree_name"
-    fi
+  if ! git -C "$repo_root" worktree add "$target" "$worktree_name"; then
+    die "$worktree_add_error"
   fi
 
   copy_local_config_file "$repo_root" "$target" ".claude/settings.local.json"
@@ -247,8 +352,11 @@ create_worktree() {
   rollback_enabled=0
 
   printf 'Created worktree: %s\n' "$target"
-  printf 'Branch: %s\n' "$worktree_name"
+  printf '%s\n' "$branch_summary"
   printf 'Opened Herdr tab for: %s\n' "$target"
+  if [[ -n "$branch_warning" ]]; then
+    warn "$branch_warning"
+  fi
 }
 
 release_worktree() {
@@ -314,7 +422,7 @@ release_worktree() {
   if [[ -n "$branch" ]]; then
     printf 'Branch retained: %s\n' "$branch"
   elif [[ -n "$detached_commit" ]]; then
-    printf 'Detached HEAD was: %s\n' "$(git -C "$main_worktree" rev-parse --short "$detached_commit")"
+    printf 'Detached HEAD was: %s\n' "$(short_commit "$main_worktree" "$detached_commit")"
   fi
   printf 'The current shell is now inside a removed directory.\n'
   printf 'Press Control-D to close this tab, or run:\n'

@@ -42,16 +42,46 @@ assert_file_contains() {
   grep -F -- "$expected" "$file" >/dev/null 2>&1
 }
 
+configure_identity() {
+  git -C "$1" config user.name "Worktree Test"
+  git -C "$1" config user.email "worktree-test@example.invalid"
+}
+
 new_repo() {
   local name=$1
   local repo=$TEST_ROOT/$name/repo
 
   mkdir -p "$repo"
   git init -q "$repo"
-  git -C "$repo" config user.name "Worktree Test"
-  git -C "$repo" config user.email "worktree-test@example.invalid"
+  configure_identity "$repo"
   git -C "$repo" commit -q --allow-empty -m initial
   printf '%s\n' "$repo"
+}
+
+# Prints a new empty commit on top of PARENT without moving any ref.
+side_commit() {
+  local repo=$1
+  local parent=$2
+  local message=$3
+
+  git -C "$repo" commit-tree -p "$parent" -m "$message" "$(git -C "$repo" rev-parse "$parent^{tree}")"
+}
+
+# Runs the command from REPO with the fake Herdr. Prefix the call with
+# FAKE_HERDR_FAIL=1 to make tab creation fail.
+run_worktree() {
+  local repo=$1
+  local stdout=$2
+  local stderr=$3
+  shift 3
+
+  (
+    cd "$repo" || exit
+    PATH="$FIXTURE_BIN:$ORIGINAL_PATH" \
+      HERDR_ENV=1 \
+      HERDR_WORKSPACE_ID=w-test \
+      "$WORKTREE_COMMAND" "$@" >"$stdout" 2>"$stderr"
+  )
 }
 
 run_test() {
@@ -94,6 +124,7 @@ test_short_base_creates_new_branch_and_tab() {
   [[ -d "$base/feature/login" ]] || return 1
   git -C "$repo" show-ref --verify --quiet refs/heads/feature/login || return 1
   assert_file_contains "$log" "tab create --workspace w-test --cwd $base/feature/login --label feature/login --focus" || return 1
+  assert_file_contains "$output" "Created branch: feature/login from $(git -C "$repo" rev-parse --short HEAD)" || return 1
   assert_file_contains "$output" "Opened Herdr tab for: $base/feature/login"
 }
 
@@ -143,20 +174,185 @@ test_option_base_overrides_environment() {
 test_existing_branch_is_used() {
   local repo
   local base
+  local output
 
   repo=$(new_repo existing-branch)
   base=$TEST_ROOT/existing-branch/trees
+  output=$TEST_ROOT/existing-branch/output
   git -C "$repo" branch existing
 
-  (
-    cd "$repo" || exit
-    PATH="$FIXTURE_BIN:$ORIGINAL_PATH" \
-      HERDR_ENV=1 \
-      HERDR_WORKSPACE_ID=w-test \
-      "$WORKTREE_COMMAND" --base "$base" existing >/dev/null
-  )
+  run_worktree "$repo" "$output" /dev/null --base "$base" existing || return 1
 
-  [[ $(git -C "$base/existing" branch --show-current) == existing ]]
+  [[ $(git -C "$base/existing" branch --show-current) == existing ]] || return 1
+  assert_file_contains "$output" "Using existing branch: existing at $(git -C "$repo" rev-parse --short HEAD)"
+}
+
+test_stale_existing_branch_is_fast_forwarded() {
+  local repo
+  local base
+  local output
+  local old_tip
+  local head
+
+  repo=$(new_repo stale-branch)
+  base=$TEST_ROOT/stale-branch/trees
+  output=$TEST_ROOT/stale-branch/output
+  git -C "$repo" branch stale
+  old_tip=$(git -C "$repo" rev-parse --short stale)
+  git -C "$repo" commit -q --allow-empty -m "advance main"
+  head=$(git -C "$repo" rev-parse HEAD)
+
+  run_worktree "$repo" "$output" /dev/null --base "$base" stale || return 1
+
+  [[ $(git -C "$repo" rev-parse refs/heads/stale) == "$head" ]] || return 1
+  [[ $(git -C "$base/stale" rev-parse HEAD) == "$head" ]] || return 1
+  assert_file_contains "$output" "Fast-forwarded existing branch: stale ($old_tip -> $(git -C "$repo" rev-parse --short HEAD))"
+}
+
+test_diverged_existing_branch_is_kept_with_warning() {
+  local repo
+  local base
+  local error_file
+  local own_tip
+
+  repo=$(new_repo diverged-branch)
+  base=$TEST_ROOT/diverged-branch/trees
+  error_file=$TEST_ROOT/diverged-branch/error
+  own_tip=$(side_commit "$repo" HEAD "own work")
+  git -C "$repo" branch diverged "$own_tip"
+  git -C "$repo" commit -q --allow-empty -m "advance main"
+  git -C "$repo" commit -q --allow-empty -m "advance main again"
+
+  run_worktree "$repo" /dev/null "$error_file" --base "$base" diverged || return 1
+
+  [[ $(git -C "$repo" rev-parse refs/heads/diverged) == "$own_tip" ]] || return 1
+  assert_file_contains "$error_file" "warning: Existing branch diverged is 2 commit(s) behind HEAD and was not fast-forwarded because it has its own commits"
+}
+
+test_stacked_branch_is_not_fast_forwarded() {
+  local repo
+  local base
+  local error_file
+  local parent_tip
+  local child_tip
+  local default_branch
+
+  repo=$(new_repo stacked-branch)
+  base=$TEST_ROOT/stacked-branch/trees
+  error_file=$TEST_ROOT/stacked-branch/error
+  default_branch=$(git -C "$repo" branch --show-current)
+  parent_tip=$(side_commit "$repo" HEAD "parent work")
+  child_tip=$(side_commit "$repo" "$parent_tip" "child work")
+  git -C "$repo" branch parent "$parent_tip"
+  git -C "$repo" branch child "$child_tip"
+  git -C "$repo" switch -q child
+
+  run_worktree "$repo" /dev/null "$error_file" --base "$base" parent || return 1
+
+  [[ $(git -C "$repo" rev-parse refs/heads/parent) == "$parent_tip" ]] || return 1
+  assert_file_contains "$error_file" "was not fast-forwarded because it has commits that are not in $default_branch"
+}
+
+test_tracking_branch_is_not_fast_forwarded() {
+  local repo
+  local base
+  local error_file
+  local old_tip
+  local default_branch
+
+  repo=$(new_repo tracking-branch)
+  base=$TEST_ROOT/tracking-branch/trees
+  error_file=$TEST_ROOT/tracking-branch/error
+  default_branch=$(git -C "$repo" branch --show-current)
+  git -C "$repo" branch tracked
+  git -C "$repo" branch -q --set-upstream-to="$default_branch" tracked
+  old_tip=$(git -C "$repo" rev-parse tracked)
+  git -C "$repo" commit -q --allow-empty -m "advance main"
+
+  run_worktree "$repo" /dev/null "$error_file" --base "$base" tracked || return 1
+
+  [[ $(git -C "$repo" rev-parse refs/heads/tracked) == "$old_tip" ]] || return 1
+  assert_file_contains "$error_file" "was not fast-forwarded because it tracks $default_branch"
+}
+
+test_branch_is_not_fast_forwarded_without_default_branch() {
+  local repo
+  local base
+  local error_file
+  local old_tip
+
+  repo=$(new_repo no-default-branch)
+  base=$TEST_ROOT/no-default-branch/trees
+  error_file=$TEST_ROOT/no-default-branch/error
+  git -C "$repo" branch -m trunk
+  git -C "$repo" branch stale
+  old_tip=$(git -C "$repo" rev-parse stale)
+  git -C "$repo" commit -q --allow-empty -m "advance trunk"
+
+  run_worktree "$repo" /dev/null "$error_file" --base "$base" stale || return 1
+
+  [[ $(git -C "$repo" rev-parse refs/heads/stale) == "$old_tip" ]] || return 1
+  assert_file_contains "$error_file" "was not fast-forwarded because no default branch was found"
+}
+
+test_origin_head_is_used_as_default_branch() {
+  local upstream
+  local repo
+  local base
+  local head
+
+  upstream=$(new_repo origin-head-upstream)
+  repo=$TEST_ROOT/origin-head/clone
+  base=$TEST_ROOT/origin-head/trees
+  git clone -q "$upstream" "$repo"
+  configure_identity "$repo"
+  git -C "$repo" switch -q -c trunk
+  git -C "$repo" branch -D -q "$(git -C "$upstream" branch --show-current)"
+  git -C "$repo" branch stale
+  git -C "$repo" commit -q --allow-empty -m "advance trunk"
+  head=$(git -C "$repo" rev-parse HEAD)
+
+  run_worktree "$repo" /dev/null /dev/null --base "$base" stale || return 1
+
+  [[ $(git -C "$repo" rev-parse refs/heads/stale) == "$head" ]]
+}
+
+test_stale_branch_in_other_worktree_is_not_moved() {
+  local repo
+  local base
+  local old_tip
+
+  repo=$(new_repo stale-occupied)
+  base=$TEST_ROOT/stale-occupied/trees
+  git -C "$repo" branch occupied
+  git -C "$repo" worktree add -q "$TEST_ROOT/stale-occupied/occupied" occupied
+  old_tip=$(git -C "$repo" rev-parse occupied)
+  git -C "$repo" commit -q --allow-empty -m "advance main"
+
+  if run_worktree "$repo" /dev/null /dev/null --base "$base" occupied; then
+    return 1
+  fi
+
+  [[ ! -e "$base/occupied" ]] || return 1
+  [[ $(git -C "$repo" rev-parse refs/heads/occupied) == "$old_tip" ]]
+}
+
+test_ahead_existing_branch_has_no_warning() {
+  local repo
+  local base
+  local error_file
+  local own_tip
+
+  repo=$(new_repo ahead-branch)
+  base=$TEST_ROOT/ahead-branch/trees
+  error_file=$TEST_ROOT/ahead-branch/error
+  own_tip=$(side_commit "$repo" HEAD "own work")
+  git -C "$repo" branch ahead "$own_tip"
+
+  run_worktree "$repo" /dev/null "$error_file" --base "$base" ahead || return 1
+
+  [[ $(git -C "$repo" rev-parse refs/heads/ahead) == "$own_tip" ]] || return 1
+  ! assert_file_contains "$error_file" "behind HEAD"
 }
 
 test_local_configs_are_copied() {
@@ -305,6 +501,25 @@ test_herdr_failure_keeps_existing_branch() {
 
   [[ ! -e "$base/existing" ]] || return 1
   git -C "$repo" show-ref --verify --quiet refs/heads/existing
+}
+
+test_herdr_failure_restores_fast_forwarded_branch() {
+  local repo
+  local base
+  local old_tip
+
+  repo=$(new_repo herdr-failure-stale)
+  base=$TEST_ROOT/herdr-failure-stale/trees
+  git -C "$repo" branch stale
+  old_tip=$(git -C "$repo" rev-parse stale)
+  git -C "$repo" commit -q --allow-empty -m "advance main"
+
+  if FAKE_HERDR_FAIL=1 run_worktree "$repo" /dev/null /dev/null --base "$base" stale; then
+    return 1
+  fi
+
+  [[ ! -e "$base/stale" ]] || return 1
+  [[ $(git -C "$repo" rev-parse refs/heads/stale) == "$old_tip" ]]
 }
 
 test_worktree_add_failure_rolls_back_side_effects() {
@@ -619,22 +834,31 @@ test_release_outside_git_fails() {
   assert_file_contains "$error_file" "Not inside a Git worktree"
 }
 
-printf '1..27\n'
+printf '1..36\n'
 run_test "help describes the command" test_help
 run_test "-b creates a nested branch worktree and focused Herdr tab" test_short_base_creates_new_branch_and_tab
 run_test "PROJECT_WORKTREE_DIR supplies the base directory" test_environment_base
 run_test "--base overrides PROJECT_WORKTREE_DIR" test_option_base_overrides_environment
 run_test "an existing local branch is reused" test_existing_branch_is_used
+run_test "an existing branch without its own commits is fast-forwarded to HEAD" test_stale_existing_branch_is_fast_forwarded
+run_test "an existing branch with its own commits is kept and warned about" test_diverged_existing_branch_is_kept_with_warning
+run_test "an existing branch ahead of HEAD is kept without a warning" test_ahead_existing_branch_has_no_warning
+run_test "a stacked branch with commits outside the default branch is not fast-forwarded" test_stacked_branch_is_not_fast_forwarded
+run_test "a branch with an upstream is not fast-forwarded" test_tracking_branch_is_not_fast_forwarded
+run_test "a branch is not fast-forwarded when no default branch exists" test_branch_is_not_fast_forwarded_without_default_branch
+run_test "origin/HEAD is used as the default branch" test_origin_head_is_used_as_default_branch
 run_test "local Claude, Codex, and Zed project settings are copied" test_local_configs_are_copied
 run_test "tracked local configuration is not overwritten" test_tracked_local_config_is_not_overwritten
 run_test "creation fails when no base directory is configured" test_missing_base_fails_before_creation
 run_test "creation fails outside Herdr before changing Git" test_creation_outside_herdr_fails
 run_test "Herdr failure rolls back a new branch and worktree" test_herdr_failure_rolls_back_new_branch
 run_test "Herdr failure preserves an existing branch" test_herdr_failure_keeps_existing_branch
+run_test "Herdr failure restores a fast-forwarded branch" test_herdr_failure_restores_fast_forwarded_branch
 run_test "worktree add failure rolls back partial Git side effects" test_worktree_add_failure_rolls_back_side_effects
 run_test "invalid command-line combinations are rejected" test_invalid_invocations
 run_test "invalid names and existing targets are rejected" test_invalid_name_and_existing_target_fail
 run_test "a branch already used by another worktree is rejected" test_branch_in_other_worktree_fails
+run_test "a stale branch used by another worktree is rejected without moving it" test_stale_branch_in_other_worktree_is_not_moved
 run_test "release works from a subdirectory and keeps the branch" test_release_from_subdirectory_keeps_branch
 run_test "--release removes a clean linked worktree" test_release_long_option
 run_test "release refuses the main worktree" test_release_refuses_main_worktree
