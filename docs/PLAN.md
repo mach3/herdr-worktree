@@ -101,7 +101,20 @@ BRANCH: feature/login
 - パス正規化後の対象がベースディレクトリ配下にある
 - 対象パスがまだ存在しない
 
-同名のローカルブランチが存在する場合はそれを checkout する。
+同名のローカルブランチが存在する場合はそれを checkout する。checkout の前に、ブランチの先端 `tip` と呼び出し元の `HEAD` を比べて、次のように扱う。
+
+- `tip` が `HEAD` と同じか、`HEAD` より進んでいるなら、そのまま使う。
+- `tip` が `HEAD` より遅れていて、次の条件をすべて満たすなら、`git branch -f -- "$name" HEAD` で `HEAD` まで進めてから使う。
+  - `tip` が `HEAD` の祖先である（`git rev-list --left-right --count "$tip...HEAD"` の左側が 0）
+  - upstream が設定されていない
+  - `tip` がデフォルトブランチの祖先である。デフォルトブランチは `origin/HEAD`、ローカルの `main`、`master` の順に探す
+- それ以外はそのまま使う。遅れているcommit数と、進めなかった理由を stderr に警告する。rebase するかどうかは利用者が決める。
+
+release でブランチを残す設計のため、`main` を更新してから同じ名前で作り直すと、古い起点のブランチが再利用されてしまう。この扱いにより、その場合も新規作成と同じ起点になる。
+
+`HEAD` の祖先であるだけでは条件として足りない。呼び出し元の `HEAD` が別のfeatureブランチのとき、そのブランチの元になったブランチを、featureブランチのcommitの上まで動かしてしまう。そのため、デフォルトブランチに含まれることも求める。また、pushしたブランチを進めると、次のpushでデフォルトブランチの履歴がリモートのブランチに入る。そのため、upstream のあるブランチも対象外にする。デフォルトブランチが見つからない場合は、安全側に倒して進めない。
+
+ブランチが別の worktree で checkout されていれば、`git branch -f` が失敗するので、そのままエラー終了する。参照を書き換える前の比較を一度に行う `git update-ref` は、この拒否をしないため使わない。
 
 ```bash
 git worktree add "$target" "$name"
@@ -129,10 +142,10 @@ git worktree add "$target" "$name"
 5. 有効な `HEAD` があることを確認する。
 6. オプションまたは環境変数からベースディレクトリを決定する。
 7. `NAME` と対象パスを検証する。
-8. ブランチの既存・新規を記録し、新規ならブランチを明示的に作成してから `git worktree add` を実行する。
+8. ブランチの既存・新規を記録する。新規ならブランチを明示的に作成し、条件を満たす既存ブランチなら `HEAD` まで進めてから、`git worktree add` を実行する。進める場合は、ロールバックを有効にしてから参照を書き換える。
 9. 呼び出し元worktreeにある対応済みのローカルAIエージェント設定をコピーする。
 10. 現在の Herdr workspace に、対象パスを cwd とするタブを作成してフォーカスする。
-11. 作成された worktree パスとブランチ名を表示する。
+11. 作成された worktree パスと、ブランチをどう扱ったか（新規作成・既存のまま・`HEAD` まで進めた）を表示する。遅れている既存ブランチの警告は stderr に出す。
 
 Herdr タブの作成には、暗黙の UI フォーカスではなく呼び出し元の workspace ID を明示する。
 
@@ -167,6 +180,7 @@ worktree 作成後の設定コピーまたは Herdr タブの作成が失敗し�
 1. 今回コピーしたローカル設定ファイルを削除する。
 2. 作成した worktree を `git worktree remove` で削除する。
 3. 今回の実行で新規作成し、作成時点から先端が更新されていないブランチだけを削除する。
+4. 今回の実行で `HEAD` まで進めた既存ブランチは、先端がそのあと更新されていなければ元の先端に戻す。ブランチが消えていた場合は、元の先端を stderr に示す。
 
 既存ブランチはロールバック時にも削除しない。`git worktree add` 自体が非ゼロで終了した場合も、作成済みのworktreeやブランチが残っていればロールバックする。ロールバック自体に失敗した場合は、残った worktree とブランチを stderr に明示する。
 
@@ -227,13 +241,13 @@ Unix では、シェルが worktree を cwd として参照している状態で
 - `1`: Git、Herdr、ファイルシステムなどの実行時エラー
 - `2`: オプションまたは引数の使用法エラー
 
-通常の結果は stdout、警告とエラーは stderr に出力する。
+通常の結果は stdout、警告とエラーは stderr に出力する。今回追加した既存ブランチの警告は `warning:`、エラーは `error:` を前に付ける。
 
 作成成功時の例:
 
 ```text
 Created worktree: /path/to/worktrees/feature/login
-Branch: feature/login
+Created branch: feature/login from 1a2b3c4
 Opened Herdr tab for: /path/to/worktrees/feature/login
 ```
 
@@ -268,6 +282,14 @@ Press Control-D to close this tab, or run:
 
 - 新規ブランチと worktree を作成する
 - 既存ローカルブランチを使用できる
+- 独自のcommitがない既存ブランチを `HEAD` まで進める
+- 独自のcommitがあり `HEAD` より遅れている既存ブランチは動かさず、警告する
+- `HEAD` より進んでいる既存ブランチは動かさず、警告もしない
+- デフォルトブランチにないcommitを持つ積み上げブランチは動かさず、警告する
+- upstream のある既存ブランチは動かさず、警告する
+- デフォルトブランチが見つからなければ動かさず、警告する
+- `origin/HEAD` をデフォルトブランチとして使う
+- 別 worktree で使用中の、進める対象の既存ブランチに対して失敗し、ブランチを動かさない
 - 対象パスが存在する場合は上書きしない
 - 無効なブランチ名とベース外へ脱出する名前を拒否する
 - 別 worktree で使用中のブランチに対して失敗する
@@ -275,6 +297,7 @@ Press Control-D to close this tab, or run:
 - `herdr tab create` に正しい workspace、cwd、label、focus が渡る
 - Herdr 失敗時に worktree と今回作成したブランチをロールバックする
 - 既存ブランチはロールバック時も残る
+- Herdr 失敗時に、`HEAD` まで進めた既存ブランチを元の先端に戻す
 - `git worktree add` が副作用を残して失敗してもworktreeと新規ブランチをロールバックする
 - 呼び出し元のClaude・Codex・Zedのローカル設定を新しいworktreeへコピーする
 - コピー先に既存の設定がある場合は上書きしない
