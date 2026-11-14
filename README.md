@@ -46,7 +46,27 @@ export PROJECT_WORKTREE_DIR="$HOME/worktrees"
 worktree feature/login
 ```
 
-同名のローカルブランチがすでに存在する場合は、そのブランチを使います。存在しない場合は、現在の `HEAD` から新しいブランチを作ります。
+同名のローカルブランチが存在しない場合は、現在の `HEAD` から新しいブランチを作ります。
+
+同名のローカルブランチがすでに存在する場合は、そのブランチを使います。ただし、次の条件をすべて満たすときは、現在の `HEAD` まで進めてから使います。
+
+- 先端が現在の `HEAD` より遅れていて、`HEAD` の祖先にある
+- 先端がデフォルトブランチに含まれている
+- upstream が設定されていない
+
+デフォルトブランチは `origin/HEAD` を使い、なければローカルの `main`、`master` の順に探します。
+
+release で残したまだpushしていないブランチを、`main` を更新したあとで作り直す場合などに、新規作成と同じ起点になります。デフォルトブランチにないcommitを持つブランチや、pushしたブランチは動かしません。たとえば、別のブランチから切ったブランチや、マージ済みのブランチです。
+
+`HEAD` より遅れているのに進めなかったときは、何commit遅れているかと進めなかった理由を警告します。`HEAD` から始めたいときは、自分でrebaseしてください。
+
+ブランチをどう扱ったかは、作成後の出力で確認できます。
+
+```text
+Created branch: feature/login from 1a2b3c4
+Using existing branch: feature/login at 1a2b3c4
+Fast-forwarded existing branch: feature/login (0f9e8d7 -> 1a2b3c4)
+```
 
 保存先を一時的に変更する場合:
 
